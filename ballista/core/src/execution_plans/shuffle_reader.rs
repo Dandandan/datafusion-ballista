@@ -697,6 +697,11 @@ impl RecordBatchStream for GovernedStream {
     }
 }
 
+/// Batches buffered ahead of the consumer while a node-local partition is decoded on a blocking
+/// thread. Small enough that a slow consumer stalls the decode rather than accumulating a
+/// partition in memory, large enough that the decoder is not woken per batch.
+const LOCAL_READ_BATCH_BUFFER: usize = 2;
+
 /// Splits the provided partition locations into local and remote partitions.
 /// Local partitions are read directly from local Arrow IPC files,
 /// while remote partitions are fetched using the Arrow Flight client.
@@ -816,18 +821,61 @@ fn send_fetch_partitions(
     read_metrics.remote_partitions.add(remote_locations.len());
 
     // keep local shuffle files reading in serial order for memory control.
+    //
+    // Opening the file is only the start of the work: decoding a local partition is blocking
+    // file I/O, and the stream `fetch_partition_local` hands back does that decoding lazily,
+    // whenever it is polled. Polling happens on a runtime worker, so decoding here rather than
+    // returning the stream directly is what keeps those reads off the async workers. Batches go
+    // out over a bounded channel, so a slow consumer still backpressures the decode.
     let response_sender_c = response_sender.clone();
     let work_dir = work_dir.to_string();
     let local_read_time = read_metrics.local_read_time.clone();
     spawned_tasks.push(SpawnedTask::spawn_blocking({
         move || {
             for p in local_locations {
-                let r = {
+                let opened = {
                     let _timer = local_read_time.timer();
                     fetch_partition_local(&work_dir, &p)
                 };
-                if let Err(e) = response_sender_c.blocking_send(r) {
+
+                let mut stream = match opened {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        if let Err(e) = response_sender_c.blocking_send(Err(e)) {
+                            error!(
+                                "Fail to send response event to the channel due to {e}"
+                            );
+                        }
+                        continue;
+                    }
+                };
+
+                let (batch_sender, batch_receiver) =
+                    mpsc::channel(LOCAL_READ_BATCH_BUFFER);
+                let decoded = Box::pin(RecordBatchStreamAdapter::new(
+                    stream.schema(),
+                    ReceiverStream::new(batch_receiver),
+                )) as SendableRecordBatchStream;
+
+                if let Err(e) = response_sender_c.blocking_send(Ok(decoded)) {
                     error!("Fail to send response event to the channel due to {e}");
+                    return;
+                }
+
+                loop {
+                    let batch = {
+                        let _timer = local_read_time.timer();
+                        futures::executor::block_on(stream.next())
+                    };
+                    match batch {
+                        Some(batch) => {
+                            // the consumer dropped this partition's stream, so stop decoding it
+                            if batch_sender.blocking_send(batch).is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
         }
@@ -1836,6 +1884,57 @@ mod tests {
 
         assert!(local.is_empty());
         assert!(!remote.is_empty());
+    }
+
+    /// Node-local partitions are decoded on a blocking thread and handed to the consumer over a
+    /// bounded channel rather than as a lazily-decoded file stream. The batches, and their
+    /// order, must survive that hop.
+    #[tokio::test]
+    async fn test_local_partitions_stream_through_decode_channel() {
+        let schema = Arc::new(get_test_partition_schema());
+        let batches: Vec<RecordBatch> = (0..3)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from(vec![i]))],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let tmp_dir = tempdir().unwrap();
+        let work_dir = tmp_dir.path();
+
+        // job name and stage id must match `get_test_partition_locations`
+        let file_path =
+            create_shuffle_path(work_dir, &"job".into(), 1, 0, None, false).unwrap();
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let file = File::create(&file_path).unwrap();
+        let mut writer = StreamWriter::try_new(file, schema.as_ref()).unwrap();
+        for batch in &batches {
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let partition_locations = get_test_partition_locations(1, None);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let read_metrics = ShuffleReadMetrics::new(0, &metrics);
+
+        let receiver = send_fetch_partitions(
+            work_dir.to_string_lossy().as_ref(),
+            partition_locations,
+            &SessionConfig::new(),
+            None,
+            read_metrics,
+        );
+
+        let mut stream: SendableRecordBatchStream = Box::pin(
+            RecordBatchStreamAdapter::new(schema, receiver.try_flatten()),
+        );
+        let result = utils::collect_stream(&mut stream).await.unwrap();
+
+        assert_eq!(result, batches);
     }
 
     async fn test_send_fetch_partitions(max_request_num: usize, partition_num: usize) {
