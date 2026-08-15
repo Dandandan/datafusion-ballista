@@ -417,9 +417,16 @@ impl ExecutionPlan for ShuffleReaderExec {
             read_metrics,
         );
 
+        // Flatten the per-block streams concurrently rather than one after the
+        // other. Shuffle input is unordered by construction, and draining in
+        // arrival order would hold every block behind the one in front of it —
+        // which for node-local blocks means their decode never overlaps, since
+        // that decode is driven by these very polls. Concurrency is bounded by
+        // how many block streams exist at once: the local readers and the
+        // in-flight remote fetches, both already capped upstream.
         let input_stream = Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
-            response_receiver.try_flatten(),
+            response_receiver.try_flatten_unordered(None),
         ));
 
         Ok(Box::pin(CoalescedShuffleReaderStream::new(
@@ -768,6 +775,100 @@ impl ShuffleReadMetrics {
     }
 }
 
+/// Batches a local reader may run ahead of its consumer, per reader.
+///
+/// Peak buffered batches for one reduce task is
+/// `max_local_readers * (LOCAL_READ_PREFETCH_BATCHES + 1)` — the `+ 1` is the
+/// batch a blocked `blocking_send` is holding.
+const LOCAL_READ_PREFETCH_BATCHES: usize = 2;
+
+/// Reads node-local shuffle blocks on the blocking pool, `max_local_readers`
+/// at a time.
+///
+/// Opening the file is the cheap part; the cost is the LZ4 decompression and
+/// IPC decode of every message, which the returned `LocalShuffleStream` /
+/// `MultiStreamPartitionStream` perform synchronously inside `poll_next`.
+/// Handing those streams straight to the consumer therefore does two unwanted
+/// things: it runs blocking file I/O on a tokio worker thread, and it
+/// serialises every local block behind the one before it, while remote blocks
+/// are fetched concurrently under the governor.
+///
+/// Instead each reader drains its blocks here, on a blocking thread, into a
+/// bounded channel. The bound is what keeps the memory behaviour close to the
+/// previous serial reader: a reader may run at most
+/// `LOCAL_READ_PREFETCH_BATCHES` batches ahead of the consumer, and blocks
+/// once it does.
+fn spawn_local_readers(
+    work_dir: &str,
+    local_locations: Vec<PartitionLocation>,
+    max_local_readers: usize,
+    response_sender: &mpsc::Sender<
+        result::Result<SendableRecordBatchStream, BallistaError>,
+    >,
+    read_metrics: &ShuffleReadMetrics,
+    spawned_tasks: &mut Vec<SpawnedTask<()>>,
+) {
+    if local_locations.is_empty() {
+        return;
+    }
+    let readers = max_local_readers.max(1).min(local_locations.len());
+
+    // Round-robin rather than contiguous chunks: `execute` has already
+    // interleaved the locations across producing executors, so this keeps each
+    // reader's share representative if block sizes are skewed.
+    let mut shards: Vec<Vec<PartitionLocation>> =
+        (0..readers).map(|_| Vec::new()).collect();
+    for (i, p) in local_locations.into_iter().enumerate() {
+        shards[i % readers].push(p);
+    }
+
+    for shard in shards {
+        let response_sender = response_sender.clone();
+        let work_dir = work_dir.to_string();
+        let local_read_time = read_metrics.local_read_time.clone();
+        spawned_tasks.push(SpawnedTask::spawn_blocking(move || {
+            for p in shard {
+                let opened = {
+                    let _timer = local_read_time.timer();
+                    fetch_partition_local(&work_dir, &p)
+                };
+                let stream = match opened {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        if let Err(e) = response_sender.blocking_send(Err(e)) {
+                            error!(
+                                "Fail to send response event to the channel due to {e}"
+                            );
+                        }
+                        continue;
+                    }
+                };
+
+                let schema = stream.schema();
+                let (batch_tx, batch_rx) = mpsc::channel(LOCAL_READ_PREFETCH_BATCHES);
+                let buffered: SendableRecordBatchStream = Box::pin(
+                    RecordBatchStreamAdapter::new(schema, ReceiverStream::new(batch_rx)),
+                );
+                if response_sender.blocking_send(Ok(buffered)).is_err() {
+                    // Consumer went away; nothing left to read for.
+                    return;
+                }
+
+                // `LocalShuffleStream` and `MultiStreamPartitionStream` are
+                // synchronous underneath — they never return `Pending` — so
+                // driving them from this blocking thread never parks it on the
+                // reactor.
+                let _timer = local_read_time.timer();
+                for batch in futures::executor::block_on_stream(stream) {
+                    if batch_tx.blocking_send(batch).is_err() {
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+}
+
 fn send_fetch_partitions(
     work_dir: &str,
     partition_locations: Vec<PartitionLocation>,
@@ -781,6 +882,7 @@ fn send_fetch_partitions(
     let max_blocks_per_addr =
         ballista_config.shuffle_reader_max_blocks_in_flight_per_address();
     let default_block_size = ballista_config.shuffle_reader_default_block_size_bytes();
+    let max_local_readers = ballista_config.shuffle_reader_max_local_readers();
 
     let (response_sender, response_receiver) = mpsc::channel(max_reqs.max(1));
 
@@ -815,23 +917,14 @@ fn send_fetch_partitions(
     read_metrics.local_partitions.add(local_locations.len());
     read_metrics.remote_partitions.add(remote_locations.len());
 
-    // keep local shuffle files reading in serial order for memory control.
-    let response_sender_c = response_sender.clone();
-    let work_dir = work_dir.to_string();
-    let local_read_time = read_metrics.local_read_time.clone();
-    spawned_tasks.push(SpawnedTask::spawn_blocking({
-        move || {
-            for p in local_locations {
-                let r = {
-                    let _timer = local_read_time.timer();
-                    fetch_partition_local(&work_dir, &p)
-                };
-                if let Err(e) = response_sender_c.blocking_send(r) {
-                    error!("Fail to send response event to the channel due to {e}");
-                }
-            }
-        }
-    }));
+    spawn_local_readers(
+        work_dir,
+        local_locations,
+        max_local_readers,
+        &response_sender,
+        &read_metrics,
+        &mut spawned_tasks,
+    );
 
     let grpc_config: Arc<GrpcClientConfig> = Arc::new((&config.ballista_config()).into());
     let customize_endpoint = config.ballista_override_create_grpc_client_endpoint();
