@@ -872,6 +872,37 @@ impl SessionConfigHelperExt for SessionConfig {
             //
             // See https://github.com/apache/datafusion-ballista/issues/1375
             .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", false)
+            //
+            // DataFusion's partial aggregate probes its first
+            // `skip_partial_aggregation_probe_rows_threshold` (100k) rows and
+            // stops aggregating when the distinct-group ratio in that window
+            // exceeds `..._probe_ratio_threshold` (0.8), streaming raw rows
+            // through instead. Single-node that trade is sound: the rows go to
+            // the next in-memory operator. In Ballista the partial aggregate
+            // always sits directly under a shuffle writer, so giving up on
+            // map-side reduction means the extra rows are IPC-encoded,
+            // compressed, written to disk, pulled over the network and decoded
+            // again.
+            //
+            // The probe is also myopic on exactly the inputs distributed
+            // queries care about: a 100k-row window over a group space larger
+            // than the window looks fully distinct even when the whole input
+            // reduces several-fold. Measured on 4M rows / 16 shuffle
+            // partitions, group cardinality 5% of the row count: the probe
+            // fires and the map stage writes 32.4 MiB of shuffle instead of
+            // 6.7 MiB — 4.8x — while also being *slower*, because writing 4M
+            // rows costs more than aggregating them.
+            //
+            // A threshold of 1.0 keeps map-side aggregation on. The cost when
+            // the data genuinely does not reduce is bounded (roughly 2x the
+            // partial-aggregate CPU, with the shuffle unchanged), which is the
+            // right side of the trade when the alternative is paid in shuffle
+            // bytes. Users who want DataFusion's behavior back can
+            // `SET datafusion.execution.skip_partial_aggregation_probe_ratio_threshold = 0.8`.
+            .set_str(
+                "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+                "1.0",
+            )
     }
 }
 
