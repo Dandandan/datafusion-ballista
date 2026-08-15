@@ -452,6 +452,10 @@ impl RecordBatchStream for FlightDataStream {
 /// <https://github.com/apache/datafusion-ballista/issues/1315>
 pub struct BlockDataStream<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> {
     decoder: StreamDecoder,
+    /// The chunk currently being drained. [`StreamDecoder::decode`] advances it
+    /// as it consumes bytes and buffers any trailing partial message
+    /// internally, so this never has to accumulate across chunks — each chunk
+    /// is handed over as-is and dropped once empty.
     state_buffer: Buffer,
     ipc_stream: S,
     transmitted: usize,
@@ -528,12 +532,20 @@ impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> BlockDataStream<S> {
         self.decoder.decode(&mut self.state_buffer)
     }
 
+    /// Hands the next received chunk to the decoder.
+    ///
+    /// `Buffer::from(Bytes)` adopts the received allocation rather than copying
+    /// it, and the previous chunk is always fully consumed before this is
+    /// called, so a chunk crosses this boundary without being copied. Message
+    /// bodies that fit inside one chunk are then sliced out of it zero-copy by
+    /// the decoder.
     fn extend_bytes(&mut self, blob: prost::bytes::Bytes) {
-        //
-        //TODO: do we want to limit maximum buffer size here as well?
-        //
+        debug_assert!(
+            self.state_buffer.is_empty(),
+            "previous chunk must be drained before the next is accepted"
+        );
         self.transmitted += blob.len();
-        self.state_buffer = Self::combine_buffers(&self.state_buffer, &Buffer::from(blob))
+        self.state_buffer = Buffer::from(blob);
     }
 }
 
@@ -547,23 +559,27 @@ impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> Stream
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         loop {
-            match self.decode() {
-                Ok(Some(batch)) => return std::task::Poll::Ready(Some(Ok(batch))),
-                Ok(None) => {} // buffer drained, pull more bytes below
-                Err(e) if is_post_eos_error(&e) => {
-                    // Decoder reached EOS but the byte stream contains more
-                    // sub-streams (e.g. sort-shuffle's leading schema-header
-                    // stream followed by the requested partition's streams).
-                    // Reset the decoder; the schema captured at construction
-                    // time stays authoritative for downstream consumers.
-                    self.decoder = StreamDecoder::new();
-                    continue;
-                }
-                Err(e) => {
-                    return std::task::Poll::Ready(Some(Err(ArrowError::IpcError(
-                        e.to_string(),
-                    )
-                    .into())));
+            // `decode` returns `Ok(None)` only once the chunk is fully
+            // consumed, so a non-empty `state_buffer` always has work left.
+            if !self.state_buffer.is_empty() {
+                match self.decode() {
+                    Ok(Some(batch)) => return std::task::Poll::Ready(Some(Ok(batch))),
+                    Ok(None) => {} // chunk drained, pull the next one below
+                    Err(e) if is_post_eos_error(&e) => {
+                        // Decoder reached EOS but the byte stream contains more
+                        // sub-streams (e.g. sort-shuffle's leading schema-header
+                        // stream followed by the requested partition's streams).
+                        // Reset the decoder; the schema captured at construction
+                        // time stays authoritative for downstream consumers.
+                        self.decoder = StreamDecoder::new();
+                        continue;
+                    }
+                    Err(e) => {
+                        return std::task::Poll::Ready(Some(Err(ArrowError::IpcError(
+                            e.to_string(),
+                        )
+                        .into())));
+                    }
                 }
             }
 
