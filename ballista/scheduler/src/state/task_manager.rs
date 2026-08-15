@@ -32,7 +32,8 @@ use ballista_core::execution_plans::compute_global_output_partition_ids;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
-    JobStatus, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus, job_status,
+    JobStatus, KeyValuePair, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus,
+    job_status,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use ballista_core::{JobId, JobStatusSubscriber};
@@ -882,6 +883,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             .as_millis() as u64;
         let codec = self.codec.physical_extension_codec();
 
+        // Walking the whole `SessionConfig` is expensive and every task of a stage
+        // shares the same one, so only do it when the config actually changes.
+        let mut cached_props: Option<(Arc<SessionConfig>, Vec<KeyValuePair>)> = None;
+
         let mut multi_tasks = Vec::with_capacity(tasks.len());
         for task in tasks {
             let restricted = restrict_plan_to_partitions(
@@ -891,7 +896,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(restricted, codec)?;
             plan_proto.try_encode(&mut plan_buf)?;
-            let props = task.session_config.to_key_value_pairs();
+            let props = match &cached_props {
+                Some((config, props)) if Arc::ptr_eq(config, &task.session_config) => {
+                    props.clone()
+                }
+                _ => {
+                    let props = task.session_config.to_key_value_pairs();
+                    cached_props = Some((task.session_config.clone(), props.clone()));
+                    props
+                }
+            };
             let task_ids = vec![TaskId {
                 task_id: task.key.task_id as u32,
                 task_attempt_num: task.task_attempt as u32,
