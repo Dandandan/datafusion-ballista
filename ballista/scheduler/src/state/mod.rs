@@ -47,6 +47,9 @@ pub mod execution_graph_dot;
 pub mod execution_stage;
 /// Executor registration and management.
 pub mod executor_manager;
+/// Micro benchmarks for the scheduler hot paths.
+#[cfg(test)]
+mod scheduler_bench;
 /// Session state management.
 pub mod session_manager;
 /// Per-task plan rewriter (restrict scan/shuffle-reader to task's slice).

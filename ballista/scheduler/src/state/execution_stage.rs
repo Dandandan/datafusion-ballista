@@ -217,6 +217,14 @@ pub struct RunningStage {
     /// task_id. When any partition exceeds `stage_max_failures`, the
     /// stage is failed.
     pub task_failure_numbers: Vec<usize>,
+    /// Number of Successful tasks whose slice covers each plan input
+    /// partition. Indexed by partition id. Maintained incrementally by
+    /// `update_task_info` / `reset_tasks` so that `is_successful` does not
+    /// have to walk `task_infos` on every task status update.
+    partition_cover_counts: Vec<usize>,
+    /// Number of entries in `partition_cover_counts` which are non-zero, i.e.
+    /// the number of partitions covered by at least one Successful task.
+    covered_partitions: usize,
     /// Combined metrics of the already finished tasks in the stage, If it is None, no task is finished yet.
     pub stage_metrics: Option<Vec<MetricsSet>>,
     /// [SessionConfig] used for this stage
@@ -638,6 +646,8 @@ impl RunningStage {
             pending: PendingPartitions::new(partitions),
             task_infos: Vec::new(),
             task_failure_numbers: vec![0; partitions],
+            partition_cover_counts: vec![0; partitions],
+            covered_partitions: 0,
             stage_metrics: None,
             session_config,
             runtime_stats_reports: Vec::new(),
@@ -723,18 +733,30 @@ impl RunningStage {
     /// Retried tasks may leave Failed entries in `task_infos`; a partition
     /// counts as covered if any Successful task's slice includes it.
     pub fn is_successful(&self) -> bool {
-        if !self.pending.is_empty() {
-            return false;
+        self.pending.is_empty() && self.covered_partitions == self.partitions
+    }
+
+    /// Record that a Successful task covers `partitions`
+    fn add_partition_coverage(&mut self, partitions: &[usize]) {
+        for p in partitions {
+            if self.partition_cover_counts[*p] == 0 {
+                self.covered_partitions += 1;
+            }
+            self.partition_cover_counts[*p] += 1;
         }
-        let mut covered = vec![false; self.partitions];
-        for info in &self.task_infos {
-            if matches!(info.task_status, task_status::Status::Successful(_)) {
-                for p in &info.global_input_partition_ids {
-                    covered[*p] = true;
+    }
+
+    /// Record that a task which used to be Successful no longer is
+    fn remove_partition_coverage(&mut self, partitions: &[usize]) {
+        for p in partitions {
+            let count = &mut self.partition_cover_counts[*p];
+            if *count > 0 {
+                *count -= 1;
+                if *count == 0 {
+                    self.covered_partitions -= 1;
                 }
             }
         }
-        covered.iter().all(|c| *c)
     }
 
     /// Returns the number of task attempts that reached Successful status
@@ -803,7 +825,10 @@ impl RunningStage {
         let scheduled_time = task_info.scheduled_time;
         let global_input_partition_ids = task_info.global_input_partition_ids.clone();
         let vcores_consumed = task_info.vcores_consumed;
+        let was_successful =
+            matches!(task_info.task_status, task_status::Status::Successful(_));
         let task_status = status.status.unwrap();
+        let is_successful = matches!(task_status, task_status::Status::Successful(_));
         let updated_task_info = TaskInfo {
             task_id,
             scheduled_time,
@@ -819,6 +844,12 @@ impl RunningStage {
             vcores_consumed,
         };
         self.task_infos[task_id] = updated_task_info;
+
+        match (was_successful, is_successful) {
+            (false, true) => self.add_partition_coverage(&global_input_partition_ids),
+            (true, false) => self.remove_partition_coverage(&global_input_partition_ids),
+            _ => {}
+        }
 
         match task_status {
             task_status::Status::Failed(failed_task) if failed_task.retryable => {
@@ -1055,6 +1086,7 @@ impl RunningStage {
     pub fn reset_tasks(&mut self, executor: &str) -> usize {
         let mut reset = 0;
         let mut to_reschedule: Vec<usize> = vec![];
+        let mut uncovered: Vec<usize> = vec![];
         let mut reset_task_ids: HashSet<usize> = HashSet::new();
         for (task_id, task) in self.task_infos.iter_mut().enumerate() {
             let matches_exec = match &task.task_status {
@@ -1065,6 +1097,8 @@ impl RunningStage {
                 _ => false,
             };
             if matches_exec {
+                let was_successful =
+                    matches!(task.task_status, task_status::Status::Successful(_));
                 task.task_status = task_status::Status::Failed(FailedTask {
                     error: format!("Task failure due to Executor {executor} lost"),
                     retryable: true,
@@ -1072,10 +1106,14 @@ impl RunningStage {
                     failed_reason: Some(FailedReason::ResultLost(ResultLost {})),
                 });
                 to_reschedule.extend(task.global_input_partition_ids.iter().copied());
+                if was_successful {
+                    uncovered.extend(task.global_input_partition_ids.iter().copied());
+                }
                 reset_task_ids.insert(task_id);
                 reset += 1;
             }
         }
+        self.remove_partition_coverage(&uncovered);
         self.pending.reschedule(to_reschedule);
         self.runtime_stats_reports
             .retain(|s| !reset_task_ids.contains(&s.producer_task_id));
@@ -1160,6 +1198,20 @@ impl SuccessfulStage {
         }
         to_reschedule.sort_unstable();
         pending.reschedule(to_reschedule);
+        // `task_infos` is carried over, so the coverage counters have to be seeded from
+        // the tasks which are still Successful.
+        let mut partition_cover_counts = vec![0usize; self.partitions];
+        let mut covered_partitions = 0;
+        for task in &self.task_infos {
+            if matches!(task.task_status, task_status::Status::Successful(_)) {
+                for &p in &task.global_input_partition_ids {
+                    if partition_cover_counts[p] == 0 {
+                        covered_partitions += 1;
+                    }
+                    partition_cover_counts[p] += 1;
+                }
+            }
+        }
         let stage_metrics = if self.stage_metrics.is_empty() {
             None
         } else {
@@ -1176,6 +1228,8 @@ impl SuccessfulStage {
             task_infos: self.task_infos.clone(),
             // It is Ok to forget the previous task failure attempts
             task_failure_numbers: vec![0; self.partitions],
+            partition_cover_counts,
+            covered_partitions,
             stage_metrics,
             session_config: self.session_config.clone(),
             stage_running_time: SystemTime::now()
@@ -1819,5 +1873,103 @@ mod tests {
         // Only executor-2's producer survives.
         assert_eq!(stage.runtime_stats_reports.len(), 1);
         assert_eq!(stage.runtime_stats_reports[0].producer_task_id, 2);
+    }
+
+    /// A successful status reported by a specific executor
+    fn make_task_status_on(task_id: u32, executor: &str) -> TaskStatus {
+        let mut status = make_task_status(task_id);
+        status.status = Some(task_status::Status::Successful(SuccessfulTask {
+            executor_id: executor.to_string(),
+            partitions: vec![],
+            runtime_stats: vec![],
+        }));
+        status
+    }
+
+    /// Recompute partition coverage the way `is_successful` used to, so the
+    /// incrementally maintained counters can be checked against it.
+    fn recomputed_coverage(stage: &RunningStage) -> usize {
+        let mut covered = vec![false; stage.partitions];
+        for info in &stage.task_infos {
+            if matches!(info.task_status, task_status::Status::Successful(_)) {
+                for p in &info.global_input_partition_ids {
+                    covered[*p] = true;
+                }
+            }
+        }
+        covered.iter().filter(|c| **c).count()
+    }
+
+    fn assert_coverage_in_sync(stage: &RunningStage) {
+        assert_eq!(
+            stage.covered_partitions,
+            recomputed_coverage(stage),
+            "covered_partitions drifted from the task_infos"
+        );
+        assert_eq!(
+            stage.is_successful(),
+            stage.pending.is_empty() && recomputed_coverage(stage) == stage.partitions,
+            "is_successful drifted from the task_infos"
+        );
+    }
+
+    #[test]
+    fn partition_coverage_stays_in_sync() {
+        let mut stage = make_running_stage(4);
+        assert_coverage_in_sync(&stage);
+
+        // Bind all four partitions across two executors
+        let bound = stage.pending.next_slice(2);
+        assert_eq!(bound, vec![0, 1]);
+        append_running_task(&mut stage, 0, "executor-1", bound);
+        let bound = stage.pending.next_slice(2);
+        assert_eq!(bound, vec![2, 3]);
+        append_running_task(&mut stage, 1, "executor-2", bound);
+        assert_coverage_in_sync(&stage);
+        assert!(!stage.is_successful());
+
+        // First task succeeds
+        assert!(stage.update_task_info(0, make_task_status_on(0, "executor-1")));
+        assert_coverage_in_sync(&stage);
+        assert_eq!(stage.covered_partitions, 2);
+        assert!(!stage.is_successful());
+
+        // Second task succeeds, the stage is now complete
+        assert!(stage.update_task_info(1, make_task_status_on(1, "executor-2")));
+        assert_coverage_in_sync(&stage);
+        assert!(stage.is_successful());
+
+        // Losing executor-1 takes its partitions back out of coverage and
+        // pushes them back onto the pending queue
+        assert_eq!(stage.reset_tasks("executor-1"), 1);
+        assert_coverage_in_sync(&stage);
+        assert_eq!(stage.covered_partitions, 2);
+        assert!(!stage.is_successful());
+
+        // Re-run the lost partitions on another executor
+        let bound = stage.pending.next_slice(2);
+        assert_eq!(bound, vec![0, 1]);
+        append_running_task(&mut stage, 2, "executor-3", bound);
+        assert!(stage.update_task_info(2, make_task_status_on(2, "executor-3")));
+        assert_coverage_in_sync(&stage);
+        assert!(stage.is_successful());
+    }
+
+    #[test]
+    fn partition_coverage_survives_stage_rerun() {
+        let mut stage = make_running_stage(2);
+        let bound = stage.pending.next_slice(2);
+        append_running_task(&mut stage, 0, "executor-1", bound);
+        assert!(stage.update_task_info(0, make_task_status_on(0, "executor-1")));
+        assert!(stage.is_successful());
+
+        // A successful stage that gets re-run has to rebuild its coverage from
+        // the task infos it carries over
+        let mut successful = stage.to_successful();
+        assert_eq!(successful.reset_tasks("executor-1"), 1);
+        let rerun = successful.to_running();
+        assert_coverage_in_sync(&rerun);
+        assert_eq!(rerun.covered_partitions, 0);
+        assert!(!rerun.is_successful());
     }
 }
