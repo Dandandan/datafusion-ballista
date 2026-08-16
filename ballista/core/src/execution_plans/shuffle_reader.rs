@@ -417,9 +417,16 @@ impl ExecutionPlan for ShuffleReaderExec {
             read_metrics,
         );
 
+        // Flatten the per-block streams concurrently rather than one after the
+        // other. Shuffle input is unordered by construction, and draining in
+        // arrival order would hold every block behind the one in front of it —
+        // which for node-local blocks means their decode never overlaps, since
+        // that decode is driven by these very polls. Concurrency is bounded by
+        // how many block streams exist at once: the local readers and the
+        // in-flight remote fetches, both already capped upstream.
         let input_stream = Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
-            response_receiver.try_flatten(),
+            response_receiver.try_flatten_unordered(None),
         ));
 
         Ok(Box::pin(CoalescedShuffleReaderStream::new(
@@ -768,6 +775,113 @@ impl ShuffleReadMetrics {
     }
 }
 
+/// Batches a local reader may hold ahead of its consumer, per reader.
+///
+/// Depth buys almost nothing once the readers run concurrently — swept over
+/// 32 local blocks on 4 cores, 4 readers: depth 1 → 213 ms, 2 → 236 ms,
+/// 4 → 284 ms, 8 → 221 ms, 16 → 393 ms. All of the win comes from the
+/// concurrency, not from running ahead, so this stays at the minimum that
+/// still decouples the decoder from the consumer.
+///
+/// Peak buffered batches per reduce task is therefore
+/// `readers * (LOCAL_READ_PREFETCH_BATCHES + 1)` — the `+ 1` is the batch a
+/// blocked `blocking_send` is holding.
+const LOCAL_READ_PREFETCH_BATCHES: usize = 1;
+
+/// Reads node-local shuffle blocks on the blocking pool, `max_local_readers`
+/// at a time.
+///
+/// Opening the file is the cheap part; the cost is the LZ4 decompression and
+/// IPC decode of every message, which the returned `LocalShuffleStream` /
+/// `MultiStreamPartitionStream` perform synchronously inside `poll_next`.
+/// Handing those streams straight to the consumer therefore does two unwanted
+/// things: it runs blocking file I/O on a tokio worker thread, and it
+/// serialises every local block behind the one before it, while remote blocks
+/// are fetched concurrently under the governor.
+///
+/// Instead each reader drains its blocks here, on a blocking thread, into a
+/// bounded channel. The bound is what keeps the memory behaviour close to the
+/// previous serial reader: a reader may run at most
+/// `LOCAL_READ_PREFETCH_BATCHES` batches ahead of the consumer, and blocks
+/// once it does.
+///
+/// `max_local_readers` is the executor's `vcores` (see
+/// `Executor::produce_config`), not the host's CPU count and not a number of
+/// its own. Deriving it from CPUs would double-count the parallelism the
+/// executor has already spent: it runs `vcores` tasks at once and each one
+/// arrives here separately, so CPU-count readers per task would put `vcores²`
+/// threads on the blocking pool.
+fn spawn_local_readers(
+    work_dir: &str,
+    local_locations: Vec<PartitionLocation>,
+    max_local_readers: usize,
+    response_sender: &mpsc::Sender<
+        result::Result<SendableRecordBatchStream, BallistaError>,
+    >,
+    read_metrics: &ShuffleReadMetrics,
+    spawned_tasks: &mut Vec<SpawnedTask<()>>,
+) {
+    if local_locations.is_empty() {
+        return;
+    }
+    let readers = max_local_readers.max(1).min(local_locations.len());
+
+    // Round-robin rather than contiguous chunks: `execute` has already
+    // interleaved the locations across producing executors, so this keeps each
+    // reader's share representative if block sizes are skewed.
+    let mut shards: Vec<Vec<PartitionLocation>> =
+        (0..readers).map(|_| Vec::new()).collect();
+    for (i, p) in local_locations.into_iter().enumerate() {
+        shards[i % readers].push(p);
+    }
+
+    for shard in shards {
+        let response_sender = response_sender.clone();
+        let work_dir = work_dir.to_string();
+        let local_read_time = read_metrics.local_read_time.clone();
+        spawned_tasks.push(SpawnedTask::spawn_blocking(move || {
+            for p in shard {
+                let opened = {
+                    let _timer = local_read_time.timer();
+                    fetch_partition_local(&work_dir, &p)
+                };
+                let stream = match opened {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        if let Err(e) = response_sender.blocking_send(Err(e)) {
+                            error!(
+                                "Fail to send response event to the channel due to {e}"
+                            );
+                        }
+                        continue;
+                    }
+                };
+
+                let schema = stream.schema();
+                let (batch_tx, batch_rx) = mpsc::channel(LOCAL_READ_PREFETCH_BATCHES);
+                let buffered: SendableRecordBatchStream = Box::pin(
+                    RecordBatchStreamAdapter::new(schema, ReceiverStream::new(batch_rx)),
+                );
+                if response_sender.blocking_send(Ok(buffered)).is_err() {
+                    // Consumer went away; nothing left to read for.
+                    return;
+                }
+
+                // `LocalShuffleStream` and `MultiStreamPartitionStream` are
+                // synchronous underneath — they never return `Pending` — so
+                // driving them from this blocking thread never parks it on the
+                // reactor.
+                let _timer = local_read_time.timer();
+                for batch in futures::executor::block_on_stream(stream) {
+                    if batch_tx.blocking_send(batch).is_err() {
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+}
+
 fn send_fetch_partitions(
     work_dir: &str,
     partition_locations: Vec<PartitionLocation>,
@@ -781,6 +895,7 @@ fn send_fetch_partitions(
     let max_blocks_per_addr =
         ballista_config.shuffle_reader_max_blocks_in_flight_per_address();
     let default_block_size = ballista_config.shuffle_reader_default_block_size_bytes();
+    let max_local_readers = ballista_config.shuffle_reader_max_local_readers();
 
     let (response_sender, response_receiver) = mpsc::channel(max_reqs.max(1));
 
@@ -815,23 +930,14 @@ fn send_fetch_partitions(
     read_metrics.local_partitions.add(local_locations.len());
     read_metrics.remote_partitions.add(remote_locations.len());
 
-    // keep local shuffle files reading in serial order for memory control.
-    let response_sender_c = response_sender.clone();
-    let work_dir = work_dir.to_string();
-    let local_read_time = read_metrics.local_read_time.clone();
-    spawned_tasks.push(SpawnedTask::spawn_blocking({
-        move || {
-            for p in local_locations {
-                let r = {
-                    let _timer = local_read_time.timer();
-                    fetch_partition_local(&work_dir, &p)
-                };
-                if let Err(e) = response_sender_c.blocking_send(r) {
-                    error!("Fail to send response event to the channel due to {e}");
-                }
-            }
-        }
-    }));
+    spawn_local_readers(
+        work_dir,
+        local_locations,
+        max_local_readers,
+        &response_sender,
+        &read_metrics,
+        &mut spawned_tasks,
+    );
 
     let grpc_config: Arc<GrpcClientConfig> = Arc::new((&config.ballista_config()).into());
     let customize_endpoint = config.ballista_override_create_grpc_client_endpoint();
@@ -1836,6 +1942,113 @@ mod tests {
 
         assert!(local.is_empty());
         assert!(!remote.is_empty());
+    }
+
+    /// A node-local block is decoded on a blocking thread and handed to the
+    /// consumer over a bounded channel rather than as a lazily-decoded file
+    /// stream. The batches, and their order within the block, must survive
+    /// that hop.
+    #[tokio::test]
+    async fn local_block_batches_survive_the_decode_channel() {
+        let schema = Arc::new(get_test_partition_schema());
+        let batches: Vec<RecordBatch> = (0..3)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from(vec![i]))],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let tmp_dir = tempdir().unwrap();
+        let work_dir = tmp_dir.path();
+
+        // job name and stage id must match `get_test_partition_locations`
+        let file_path =
+            create_shuffle_path(work_dir, &"job".into(), 1, 0, None, false).unwrap();
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = StreamWriter::try_new(file, schema.as_ref()).unwrap();
+        for batch in &batches {
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let receiver = send_fetch_partitions(
+            work_dir.to_string_lossy().as_ref(),
+            get_test_partition_locations(1, None),
+            &SessionConfig::new_with_ballista(),
+            None,
+            ShuffleReadMetrics::new(0, &metrics),
+        );
+
+        // A single block, so ordered flattening is enough here and keeps the
+        // assertion about within-block order meaningful.
+        let mut stream: SendableRecordBatchStream = Box::pin(
+            RecordBatchStreamAdapter::new(schema, receiver.try_flatten()),
+        );
+        let result = utils::collect_stream(&mut stream).await.unwrap();
+
+        assert_eq!(result, batches);
+    }
+
+    /// Every node-local block reaches the consumer once the readers run
+    /// concurrently and the flattening is unordered — arrival order is not
+    /// guaranteed, so this asserts on the multiset of rows.
+    #[tokio::test]
+    async fn every_local_block_is_delivered_under_concurrent_readers() {
+        let schema = Arc::new(get_test_partition_schema());
+        let partition_num = 8usize;
+        let tmp_dir = tempdir().unwrap();
+        let work_dir = tmp_dir.path();
+
+        for p in 0..partition_num {
+            let file_path =
+                create_shuffle_path(work_dir, &"job".into(), 1, p, None, false).unwrap();
+            std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            let file = File::create(&file_path).unwrap();
+            let mut writer = StreamWriter::try_new(file, schema.as_ref()).unwrap();
+            writer
+                .write(
+                    &RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(vec![p as i32]))],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let receiver = send_fetch_partitions(
+            work_dir.to_string_lossy().as_ref(),
+            get_test_partition_locations(partition_num, None),
+            &SessionConfig::new_with_ballista(),
+            None,
+            ShuffleReadMetrics::new(0, &metrics),
+        );
+
+        let mut stream: SendableRecordBatchStream = Box::pin(
+            RecordBatchStreamAdapter::new(schema, receiver.try_flatten_unordered(None)),
+        );
+        let result = utils::collect_stream(&mut stream).await.unwrap();
+
+        let mut seen: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(seen, (0..partition_num as i32).collect::<Vec<_>>());
     }
 
     async fn test_send_fetch_partitions(max_request_num: usize, partition_num: usize) {
