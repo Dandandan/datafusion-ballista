@@ -1931,6 +1931,113 @@ mod tests {
         assert!(!remote.is_empty());
     }
 
+    /// A node-local block is decoded on a blocking thread and handed to the
+    /// consumer over a bounded channel rather than as a lazily-decoded file
+    /// stream. The batches, and their order within the block, must survive
+    /// that hop.
+    #[tokio::test]
+    async fn local_block_batches_survive_the_decode_channel() {
+        let schema = Arc::new(get_test_partition_schema());
+        let batches: Vec<RecordBatch> = (0..3)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from(vec![i]))],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let tmp_dir = tempdir().unwrap();
+        let work_dir = tmp_dir.path();
+
+        // job name and stage id must match `get_test_partition_locations`
+        let file_path =
+            create_shuffle_path(work_dir, &"job".into(), 1, 0, None, false).unwrap();
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = StreamWriter::try_new(file, schema.as_ref()).unwrap();
+        for batch in &batches {
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let receiver = send_fetch_partitions(
+            work_dir.to_string_lossy().as_ref(),
+            get_test_partition_locations(1, None),
+            &SessionConfig::new_with_ballista(),
+            None,
+            ShuffleReadMetrics::new(0, &metrics),
+        );
+
+        // A single block, so ordered flattening is enough here and keeps the
+        // assertion about within-block order meaningful.
+        let mut stream: SendableRecordBatchStream = Box::pin(
+            RecordBatchStreamAdapter::new(schema, receiver.try_flatten()),
+        );
+        let result = utils::collect_stream(&mut stream).await.unwrap();
+
+        assert_eq!(result, batches);
+    }
+
+    /// Every node-local block reaches the consumer once the readers run
+    /// concurrently and the flattening is unordered — arrival order is not
+    /// guaranteed, so this asserts on the multiset of rows.
+    #[tokio::test]
+    async fn every_local_block_is_delivered_under_concurrent_readers() {
+        let schema = Arc::new(get_test_partition_schema());
+        let partition_num = 8usize;
+        let tmp_dir = tempdir().unwrap();
+        let work_dir = tmp_dir.path();
+
+        for p in 0..partition_num {
+            let file_path =
+                create_shuffle_path(work_dir, &"job".into(), 1, p, None, false).unwrap();
+            std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            let file = File::create(&file_path).unwrap();
+            let mut writer = StreamWriter::try_new(file, schema.as_ref()).unwrap();
+            writer
+                .write(
+                    &RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(vec![p as i32]))],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let receiver = send_fetch_partitions(
+            work_dir.to_string_lossy().as_ref(),
+            get_test_partition_locations(partition_num, None),
+            &SessionConfig::new_with_ballista(),
+            None,
+            ShuffleReadMetrics::new(0, &metrics),
+        );
+
+        let mut stream: SendableRecordBatchStream = Box::pin(
+            RecordBatchStreamAdapter::new(schema, receiver.try_flatten_unordered(None)),
+        );
+        let result = utils::collect_stream(&mut stream).await.unwrap();
+
+        let mut seen: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(seen, (0..partition_num as i32).collect::<Vec<_>>());
+    }
+
     async fn test_send_fetch_partitions(max_request_num: usize, partition_num: usize) {
         let schema = get_test_partition_schema();
         let data_array = Int32Array::from(vec![1]);
