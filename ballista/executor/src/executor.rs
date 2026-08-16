@@ -216,8 +216,28 @@ impl Executor {
     }
 
     /// Creates a default [`SessionConfig`] using the configured config producer.
+    ///
+    /// The reduce-side local shuffle reader sizes its concurrency from this
+    /// executor's `vcores` rather than from the host's CPU count, so an
+    /// operator who deliberately under-subscribes a shared node with
+    /// `--vcores` gets a reader count that respects that. The config entry's
+    /// own default is the host CPU count, which is what standalone and
+    /// in-process use fall back to.
     pub fn produce_config(&self) -> SessionConfig {
-        (self.config_producer)()
+        let config = (self.config_producer)();
+        if config
+            .options()
+            .extensions
+            .get::<ballista_core::config::BallistaConfig>()
+            .is_some()
+        {
+            config.set_str(
+                ballista_core::config::BALLISTA_SHUFFLE_READER_MAX_LOCAL_READERS,
+                &self.vcores.to_string(),
+            )
+        } else {
+            config
+        }
     }
 
     /// Execute one partition of a query stage and persist the result to disk in IPC format. On

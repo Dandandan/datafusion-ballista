@@ -775,12 +775,18 @@ impl ShuffleReadMetrics {
     }
 }
 
-/// Batches a local reader may run ahead of its consumer, per reader.
+/// Batches a local reader may hold ahead of its consumer, per reader.
 ///
-/// Peak buffered batches for one reduce task is
-/// `max_local_readers * (LOCAL_READ_PREFETCH_BATCHES + 1)` — the `+ 1` is the
-/// batch a blocked `blocking_send` is holding.
-const LOCAL_READ_PREFETCH_BATCHES: usize = 2;
+/// Depth buys almost nothing once the readers run concurrently — swept over
+/// 32 local blocks on 4 cores, 4 readers: depth 1 → 213 ms, 2 → 236 ms,
+/// 4 → 284 ms, 8 → 221 ms, 16 → 393 ms. All of the win comes from the
+/// concurrency, not from running ahead, so this stays at the minimum that
+/// still decouples the decoder from the consumer.
+///
+/// Peak buffered batches per reduce task is therefore
+/// `readers * (LOCAL_READ_PREFETCH_BATCHES + 1)` — the `+ 1` is the batch a
+/// blocked `blocking_send` is holding.
+const LOCAL_READ_PREFETCH_BATCHES: usize = 1;
 
 /// Reads node-local shuffle blocks on the blocking pool, `max_local_readers`
 /// at a time.
@@ -798,6 +804,13 @@ const LOCAL_READ_PREFETCH_BATCHES: usize = 2;
 /// previous serial reader: a reader may run at most
 /// `LOCAL_READ_PREFETCH_BATCHES` batches ahead of the consumer, and blocks
 /// once it does.
+///
+/// `max_local_readers` is the executor's `vcores` (see
+/// `Executor::produce_config`), not the host's CPU count and not a number of
+/// its own. Deriving it from CPUs would double-count the parallelism the
+/// executor has already spent: it runs `vcores` tasks at once and each one
+/// arrives here separately, so CPU-count readers per task would put `vcores²`
+/// threads on the blocking pool.
 fn spawn_local_readers(
     work_dir: &str,
     local_locations: Vec<PartitionLocation>,

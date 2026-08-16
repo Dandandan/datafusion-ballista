@@ -221,9 +221,10 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          DataType::UInt64,
                          Some((1048576).to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_READER_MAX_LOCAL_READERS.to_string(),
-                         "Number of node-local shuffle blocks a reduce task reads and decodes concurrently, on the blocking pool. Each reader may run up to 2 batches ahead of the consumer, so peak buffered batches per task is roughly 3x this value. 1 restores the previous fully-serial local read.".to_string(),
+                         "Number of node-local shuffle blocks a reduce task reads and decodes concurrently, on the blocking pool. Defaults to the executor's vcores, which the executor stamps in when it builds a task's session config; this static default applies to standalone and in-process use. Each reader holds at most 2 batches, so peak buffered batches per task is roughly twice this value. 1 restores the previous fully-serial local read.".to_string(),
                          DataType::UInt64,
-                         Some((4).to_string())),
+                         Some(std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1).to_string()))
+            .with_doc_default("the executor's vcores"),
         ConfigEntry::new(BALLISTA_CLIENT_INITIAL_CONNECTION_WINDOW_SIZE.to_string(),
                          "HTTP/2 initial connection-level flow-control window for gRPC data-plane clients, in bytes. Should be >= the shuffle governor byte budget so the governor, not the transport window, is the binding backpressure. 0 leaves the tonic default.".to_string(),
                          DataType::UInt64,
